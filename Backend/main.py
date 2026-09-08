@@ -25,8 +25,9 @@ def get_graph():
 G = get_graph()
 # Створення списку графів
 nodes_list = list(G.nodes)
+nodes_list.sort()
 len_nodes_list = len(nodes_list)
-n_points = 10
+n_points = 2500
 points = {}
 
 @app.get("/coordinates")
@@ -53,7 +54,7 @@ def get_new_coordinates():
             choice_weights = [90, 5, 5]
         # Вибір напрямку руху
         direction = random.choices(option, weights=choice_weights, k=1)[0]
-        if 0 <= node_index <= len_nodes_list:
+        if 0 <= node_index <= len_nodes_list-1:
             new_node_index = node_index + direction
         elif node_index < 0:
             node_index += 1
