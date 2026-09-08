@@ -33,6 +33,13 @@ const Map = () => {
             console.log(points_list)     
         })
     }
+    const redCircleIcon = L.divIcon({
+  // HTML-структура з CSS для створення кола
+        html: '<div style="background-color: red; width: 20px; height: 20px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);"></div>',
+        className: 'custom-circle-marker', // Обов'язково вкажіть клас (можна порожній), щоб скинути стандартні стилі Leaflet
+        iconSize:[20,20],               // Розмір всього контейнера іконки [ширина, висота]
+        iconAnchor:10,             // Центр кола (половина від iconSize), щоб маркер стояв точно на координаті
+    });
     const fetchNewPoints = () => {
         axios.get('http://127.0.0.1:8000/newcoordinates').then(r => {
             const newPointsResponce = r.data
@@ -52,7 +59,7 @@ const Map = () => {
         fetchPoints()    
         const interval = setInterval(() => {
             fetchNewPoints()
-        }, 2000);
+        }, 4000);
         return () => clearInterval(interval);
     }, [])
     
@@ -75,7 +82,8 @@ const Map = () => {
                 id={point.id}
                 lat={point.lat}
                 lng={point.lng}
-                duration={1500} // Час плавного переходу в мс
+                duration={4000} // Час плавного переходу в мс
+                icon={redCircleIcon}
             />
         ))}
         </MapContainer> 
