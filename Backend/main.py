@@ -2,6 +2,7 @@ from fastapi import FastAPI
 import random
 import osmnx as ox
 from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
 
 app = FastAPI()
 
@@ -27,7 +28,7 @@ G = get_graph()
 nodes_list = list(G.nodes)
 nodes_list.sort()
 len_nodes_list = len(nodes_list)
-n_points = 2500
+n_points = 1000
 points = {}
 
 @app.get("/coordinates")
@@ -66,3 +67,29 @@ def get_new_coordinates():
         new_coord_y = G.nodes[new_node_id]["y"]
         points[id] = [new_coord_x, new_coord_y,new_node_index]
     return points
+
+@app.get("/neardots")
+def get_near_dots():
+    ids = list(points.keys())
+    lons = np.array([points[pid][0] for pid in ids])  # x = довгота
+    lats = np.array([points[pid][1] for pid in ids])  # y = широта
+
+    radius_meters = 15
+
+    nearest_points = {}
+
+    for i, point_id in enumerate(ids):
+        # Відстані від поточної точки до всіх інших (у метрах)
+        distances = ox.distance.great_circle(
+            lats[i], lons[i], lats, lons
+        )
+
+        # Виключаємо саму точку
+        distances[i] = np.inf
+
+        # Індекси точок, що потрапляють у радіус
+        close_idx = np.where(distances <= radius_meters)[0]
+
+        nearest_points[point_id] = [ids[j] for j in close_idx]
+
+    return nearest_points
