@@ -14,6 +14,13 @@ L.Icon.Default.mergeOptions({
     shadowUrl: 'https://cloudflare.com',
 });
 
+const STATE_COLORS = {
+    healthy: 'green',
+    infected: 'red',
+    recovered: 'blue',
+    dead: 'black',
+};
+
 const Map = () => {
     const city_position = [49.4206, 26.9975]; 
     const [points_list, setPoint_list] = useState([])
@@ -40,6 +47,17 @@ const Map = () => {
         iconSize:[20,20],               // Розмір всього контейнера іконки [ширина, висота]
         iconAnchor:10,             // Центр кола (половина від iconSize), щоб маркер стояв точно на координаті
     });
+     // Іконка, що будується динамічно за станом точки (колір змінюється залежно від стану)
+    const getStateIcon = (state) => {
+        const color = STATE_COLORS[state];
+        return L.divIcon({
+            html: `<div style="background-color: ${color}; width: 20px; height: 20px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);"></div>`,
+            className: 'custom-circle-marker',
+            iconSize: [20, 20],
+            iconAnchor: 10,
+        });
+    }
+
     const fetchNewPoints = () => {
         axios.get('http://127.0.0.1:8000/newcoordinates').then(r => {
             const newPointsResponce = r.data
@@ -55,12 +73,40 @@ const Map = () => {
         })
     }
 
+    const initEpidemic = () => {
+        axios.get('http://127.0.0.1:8000/init_epidemic').then(r => {
+            const initResponce = r.data
+            setStates_list(initResponce.states)
+            console.log('patient_zero:', initResponce.patient_zero)
+        })
+    }
+
+    // Отримання інформації про заражені точки (один крок симуляції)
+    const fetchEpidemicStep = () => {
+        axios.get('http://127.0.0.1:8000/step_epidemic').then(r => {
+            const stepResponce = r.data
+            setStates_list(stepResponce)
+            console.log(states_list)
+        })
+    }
+
     useEffect( () => {
         fetchPoints()    
+        initEpidemic()
         const interval = setInterval(() => {
             fetchNewPoints()
         }, 4000);
-        return () => clearInterval(interval);
+        const epidemicInterval = setInterval(() => {
+            fetchEpidemicStep()
+        }, 4000);
+        const iconInterval = setInterval(() => {
+            getStateIcon()
+        }, 4000);
+        return () => {
+            clearInterval(interval),
+            clearInterval(epidemicInterval),
+            clearInterval(iconInterval)
+        };
     }, [])
     
 
@@ -83,7 +129,7 @@ const Map = () => {
                 lat={point.lat}
                 lng={point.lng}
                 duration={4000} // Час плавного переходу в мс
-                icon={redCircleIcon}
+                icon={getStateIcon()}
             />
         ))}
         </MapContainer> 
