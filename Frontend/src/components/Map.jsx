@@ -26,6 +26,8 @@ const Map = () => {
     const [points_list, setPoint_list] = useState([])
     const [new_points_list, setNewPoint_list] = useState([])
     const [loading, setLoading] = useState(true)
+    const [states_list, setStates_list] = useState({})
+    const [stats, setStats] = useState({ healthy: 0, infected: 0, recovered: 0, dead: 0 })
     const fetchPoints = () => {
         axios.get('http://127.0.0.1:8000/coordinates').then(r => {
             const pointsResponce = r.data 
@@ -77,6 +79,7 @@ const Map = () => {
         axios.get('http://127.0.0.1:8000/init_epidemic').then(r => {
             const initResponce = r.data
             setStates_list(initResponce.states)
+            setStats(initResponce.stats)
             console.log('patient_zero:', initResponce.patient_zero)
         })
     }
@@ -85,8 +88,10 @@ const Map = () => {
     const fetchEpidemicStep = () => {
         axios.get('http://127.0.0.1:8000/step_epidemic').then(r => {
             const stepResponce = r.data
-            setStates_list(stepResponce)
-            console.log(states_list)
+            const newStates = stepResponce.states
+            setStates_list(newStates)
+            setStats(stepResponce.stats)
+            setPoint_list(prev => prev.filter(point => newStates.hasOwnProperty(point.id)))
         })
     }
 
@@ -98,41 +103,64 @@ const Map = () => {
         }, 4000);
         const epidemicInterval = setInterval(() => {
             fetchEpidemicStep()
-        }, 4000);
-        const iconInterval = setInterval(() => {
-            getStateIcon()
-        }, 4000);
+        }, 2000);
         return () => {
             clearInterval(interval),
-            clearInterval(epidemicInterval),
-            clearInterval(iconInterval)
+            clearInterval(epidemicInterval)
         };
     }, [])
     
 
     return (
-        <MapContainer 
-        center={city_position} 
-        zoom={13} 
-        style={{ height: "100%", width: "100%" }}
-        >
-        {/* 5. Підключаємо безкоштовні тайли OpenStreetMap */}
-            <TileLayer
-                attribution='&copy; <a href="https://openstreetmap.org">OpenStreetMap</a> contributors'
-                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-            />
-      
-        {points_list.map((point) => (
-            <AnimatedMarker 
-                key={String(point.id)} // Ключ за ID — критично важливо для React!
-                id={point.id}
-                lat={point.lat}
-                lng={point.lng}
-                duration={4000} // Час плавного переходу в мс
-                icon={getStateIcon()}
-            />
-        ))}
-        </MapContainer> 
+        <div style={{ position: "relative", height: "100%", width: "100%" }}>
+            <MapContainer 
+            center={city_position} 
+            zoom={13} 
+            style={{ height: "100%", width: "100%" }}
+            fadeAnimation={false}
+            >
+            {/* 5. Підключаємо безкоштовні тайли OpenStreetMap */}
+                <TileLayer
+                    attribution='&copy; <a href="https://openstreetmap.org">OpenStreetMap</a> contributors'
+                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                />
+          
+            {points_list.map((point) => (
+                <AnimatedMarker 
+                    key={String(point.id)} // Ключ за ID — критично важливо для React!
+                    id={point.id}
+                    lat={point.lat}
+                    lng={point.lng}
+                    duration={4000} // Час плавного переходу в мс
+                    icon={getStateIcon(states_list[point.id])}
+                />
+            ))}
+            </MapContainer>
+
+            {/* Панель статистики в лівому нижньому куті */}
+            <div
+                style={{
+                    position: "absolute",
+                    bottom: "20px",
+                    left: "20px",
+                    zIndex: 1000,
+                    background: "rgba(255, 255, 255, 0.9)",
+                    borderRadius: "8px",
+                    padding: "12px 16px",
+                    boxShadow: "0 2px 8px rgba(0,0,0,0.3)",
+                    fontFamily: "sans-serif",
+                    fontSize: "14px",
+                    lineHeight: "1.6",
+                    minWidth: "140px",
+                }}
+            >
+                <div style={{ fontWeight: "bold", marginBottom: "6px" }}>Статистика</div>
+                <div><span style={{ color: STATE_COLORS.healthy }}>●</span> Здорові: {stats.healthy || 0}</div>
+                <div><span style={{ color: STATE_COLORS.infected }}>●</span> Заражені: {stats.infected || 0}</div>
+                <div><span style={{ color: STATE_COLORS.recovered }}>●</span> Одужалі: {stats.recovered || 0}</div>
+                <div><span style={{ color: STATE_COLORS.dead }}>●</span> Померлі: {stats.dead || 0}</div>
+            </div>
+        </div>
     );
 };
 export default Map;
