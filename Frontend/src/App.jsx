@@ -27,21 +27,7 @@ const App = () => {
 
       <div className="w-full h-full ">
         <Map/>
-      </div>
-
-      <div className="absolute top-4 Left-4 z-1000 max-w-xs">
-      <Button type="primary" onClick={toggleCollapsed} style={{ marginBottom: 16 }}>
-        {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
-      </Button>
-      <Menu
-        mode="inline"
-        theme="dark"
-        inlineCollapsed={collapsed}
-        items={items}
-      />
-      </div>
-      
-      
+      </div>     
     </div>
   );
 };
