@@ -5,6 +5,8 @@ import osmnx as ox
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import math
+import threading
+import functools
 
 app = FastAPI()
 
@@ -21,15 +23,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# FastAPI виконує звичайні (не async) ендпоінти паралельно в різних потоках.
+# Без блокування /newcoordinates (перебирає points) і /step_epidemic (видаляє мертвих з points)
+# можуть працювати одночасно: це дає помилку "dictionary changed size during iteration"
+# (тоді точки перестають рухатись) або "воскрешає" щойно померлу точку.
+sim_lock = threading.RLock()
+
+def locked(fn):
+    """Декоратор: ендпоінти, що чіпають points/states, виконуються по одному."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with sim_lock:
+            return fn(*args, **kwargs)
+    return wrapper
+
+
 def get_graph():
     G = ox.graph_from_place("Хмельницький, Україна", network_type="walk")
     return G
 
 G = get_graph()
-# Створення списку графів
+# Список вузлів графа (перехрестя та повороти вулиць)
 nodes_list = list(G.nodes)
-nodes_list.sort()
 len_nodes_list = len(nodes_list)
+
+def edge_length_m(u, v):
+    """Довжина ребра u->v у метрах (атрибут 'length' графа osmnx)."""
+    data = G.get_edge_data(u, v) or {}
+    lengths = [d["length"] for d in data.values() if d.get("length")]
+    if lengths:
+        return max(0.5, float(min(lengths)))
+    # запасний варіант: відстань по прямій між вузлами
+    a, b = G.nodes[u], G.nodes[v]
+    return max(0.5, float(ox.distance.great_circle(a["y"], a["x"], b["y"], b["x"])))
+
+# Для кожного вузла — вузли, до яких з нього можна дійти вулицею (одне ребро),
+# та довжини цих ребер. Рахуємо один раз при старті.
+neighbors_map = {
+    node_id: [v for v in G.successors(node_id) if v != node_id]
+    for node_id in nodes_list
+}
+edge_len_map = {
+    (u, v): edge_length_m(u, v)
+    for u, targets in neighbors_map.items()
+    for v in targets
+}
+
+# Параметри руху (змінюються через /params)
+MOVEMENT_STEP_M = 50   # скільки метрів проходить точка за один крок
+GPS_ERROR_MAX_M = 10   # макс. випадкова похибка позиції, м (0 = без похибки)
+
+# Стартувати можна лише з вузлів, з яких є куди йти
+movable_nodes = [node_id for node_id in nodes_list if neighbors_map[node_id]]
 n_points = 1000
 points = {}
 
@@ -37,15 +82,17 @@ def generate_points():
     """(Пере)створює всі n_points точок у випадкових вузлах графа."""
     for i in range(1, n_points + 1):
         point_id = f"{i}"
-        node_index = random.randint(0, len_nodes_list-1)
-        node_id = nodes_list[node_index]
-        coord_x = G.nodes[node_id]["x"]
-        coord_y = G.nodes[node_id]["y"]
+        from_id = random.choice(movable_nodes)
+        to_id = random.choice(neighbors_map[from_id])
+        coord_x = G.nodes[from_id]["x"]
+        coord_y = G.nodes[from_id]["y"]
 
-        points[point_id] = [coord_x, coord_y, node_index]
+        # [довгота, широта, вузол звідки, вузол куди, пройдено по ребру (м)]
+        points[point_id] = [coord_x, coord_y, from_id, to_id, 0.0]
 
 
 @app.get("/coordinates")
+@locked
 def get_coordinates():
     generate_points()
     return points
@@ -56,7 +103,9 @@ def add_gps_error(lon, lat, min_error_m=1, max_error_m=10):
     Зміщує координату (lon, lat) на випадкову відстань
     у діапазоні [min_error_m, max_error_m] метрів у випадковому напрямку.
     """
-    error_distance = random.uniform(min_error_m, max_error_m)
+    if max_error_m <= 0:
+        return lon, lat
+    error_distance = random.uniform(min(min_error_m, max_error_m), max_error_m)
     angle = random.uniform(0, 2 * math.pi)
 
     # Зміщення вздовж широти (1 градус широти ≈ 111320 метрів, майже постійно)
@@ -69,35 +118,49 @@ def add_gps_error(lon, lat, min_error_m=1, max_error_m=10):
     new_lat = lat + delta_lat
     return new_lon, new_lat
 
+def advance_along_graph(from_id, to_id, offset, distance):
+    """Проходить distance метрів вздовж вулиць, починаючи з позиції offset на ребрі from->to.
+    На перехрестях обирає випадкове ребро без розвороту (назад — лише в глухому куті)."""
+    remaining = distance
+    while True:
+        left_on_edge = edge_len_map[(from_id, to_id)] - offset
+        if remaining < left_on_edge:
+            return from_id, to_id, offset + remaining
+
+        remaining -= left_on_edge
+        options = neighbors_map.get(to_id, [])
+        if not options:
+            # вузол без виходу (рідкість): відроджуємо точку в іншому місці
+            from_id = random.choice(movable_nodes)
+            return from_id, random.choice(neighbors_map[from_id]), 0.0
+
+        forward = [n for n in options if n != from_id]
+        next_id = random.choice(forward if forward else options)
+        from_id, to_id, offset = to_id, next_id, 0.0
+
+
+def position_on_edge(from_id, to_id, offset):
+    """Координати точки на відстані offset метрів від from_id вздовж ребра до to_id."""
+    t = offset / edge_len_map[(from_id, to_id)]
+    a, b = G.nodes[from_id], G.nodes[to_id]
+    return a["x"] + (b["x"] - a["x"]) * t, a["y"] + (b["y"] - a["y"]) * t
+
+
 @app.get("/newcoordinates")
+@locked
 def get_new_coordinates():
-    global new_node_index
-    for id,coords in points.items():
-        node_index = coords[2]
-        direction = 0
-        choice_weights = [5, 5, 90]
-        # Рух - назад, на місці , вперед
-        option = [-1, 0, 1]
-        # Визначення напрямку руху
-        if direction == -1:
-            choice_weights = [90, 5, 5]
-        # Вибір напрямку руху
-        direction = random.choices(option, weights=choice_weights, k=1)[0]
-        if 0 <= node_index <= len_nodes_list-2:
-            new_node_index = node_index + direction
-            if new_node_index < 0:
-                new_node_index = 0
-            elif new_node_index >= len_nodes_list-1:
-                new_node_index -= len_nodes_list-1
+    """Кожна точка проходить MOVEMENT_STEP_M метрів вулицями (рівномірна швидкість,
+    можливо через кілька ребер за крок)."""
+    for point_id in list(points.keys()):
+        _, _, from_id, to_id, offset = points[point_id]
 
-        new_node_id = nodes_list[new_node_index]
+        from_id, to_id, offset = advance_along_graph(from_id, to_id, offset, MOVEMENT_STEP_M)
+        x, y = position_on_edge(from_id, to_id, offset)
 
-        new_coord_x = G.nodes[new_node_id]["x"]
-        new_coord_y = G.nodes[new_node_id]["y"]
+        # Похибка додається лише до відображуваної позиції, "справжній" стан лишається точним
+        x, y = add_gps_error(x, y, 1, GPS_ERROR_MAX_M)
 
-        new_coord_x, new_coord_y = add_gps_error(new_coord_x, new_coord_y)
-
-        points[id] = [new_coord_x, new_coord_y,new_node_index]
+        points[point_id] = [x, y, from_id, to_id, offset]
     return points
 
 # Радіус, у межах якого можливий контакт (метри)
@@ -129,6 +192,7 @@ def get_neighbors_with_distances():
 
 
 @app.get("/neardots")
+@locked
 def get_near_dots():
     """Те саме, що й раніше: {id: [id сусідів у радіусі]} (без відстаней)."""
     neighbors = get_neighbors_with_distances()
@@ -150,7 +214,7 @@ DEATH_PROBABILITY = 0.1       # шанс померти за крок
 INCUBATION_MIN_STEPS = 2
 INCUBATION_MAX_STEPS = 5
 
-# Реінфекція: одужалі можуть заразитися знову. Вимикається через /reinfection?enabled=false
+# Реінфекція: одужалі можуть заразитися знову. Вмикається/вимикається через /params
 REINFECTION_ENABLED = True
 REINFECTION_FACTOR = 0.3      # наскільки одужалий вразливіший за здорового (0.3 = на 70% менше шансів)
 
@@ -181,14 +245,6 @@ def get_epidemic_stats():
     return counts
 
 
-@app.get("/reinfection")
-def set_reinfection(enabled: bool):
-    """Вмикає/вимикає реінфекцію під час роботи: /reinfection?enabled=false"""
-    global REINFECTION_ENABLED
-    REINFECTION_ENABLED = enabled
-    return {"reinfection_enabled": REINFECTION_ENABLED}
-
-
 class EpidemicParams(BaseModel):
     infection_probability: float = Field(..., ge=0, le=1)
     death_probability: float = Field(..., ge=0, le=1)
@@ -197,6 +253,9 @@ class EpidemicParams(BaseModel):
     incubation_min_steps: int = Field(..., ge=0, le=1000)
     incubation_max_steps: int = Field(..., ge=0, le=1000)
     reinfection_factor: float = Field(..., ge=0, le=1)
+    reinfection_enabled: bool
+    movement_step_m: float = Field(..., gt=0, le=5000)
+    gps_error_max_m: float = Field(..., ge=0, le=100)
 
 
 def current_params():
@@ -208,6 +267,9 @@ def current_params():
         "incubation_min_steps": INCUBATION_MIN_STEPS,
         "incubation_max_steps": INCUBATION_MAX_STEPS,
         "reinfection_factor": REINFECTION_FACTOR,
+        "reinfection_enabled": REINFECTION_ENABLED,
+        "movement_step_m": MOVEMENT_STEP_M,
+        "gps_error_max_m": GPS_ERROR_MAX_M,
     }
 
 
@@ -222,7 +284,8 @@ def set_params(p: EpidemicParams):
     """Змінює параметри симуляції під час роботи. Діють з наступного кроку."""
     global INFECTION_PROBABILITY, DEATH_PROBABILITY, RECOVERY_PROBABILITY
     global INFECTION_RADIUS_M, INCUBATION_MIN_STEPS, INCUBATION_MAX_STEPS
-    global REINFECTION_FACTOR
+    global REINFECTION_FACTOR, REINFECTION_ENABLED
+    global MOVEMENT_STEP_M, GPS_ERROR_MAX_M
 
     if p.death_probability + p.recovery_probability > 1:
         raise HTTPException(
@@ -242,10 +305,14 @@ def set_params(p: EpidemicParams):
     INCUBATION_MIN_STEPS = p.incubation_min_steps
     INCUBATION_MAX_STEPS = p.incubation_max_steps
     REINFECTION_FACTOR = p.reinfection_factor
+    REINFECTION_ENABLED = p.reinfection_enabled
+    MOVEMENT_STEP_M = p.movement_step_m
+    GPS_ERROR_MAX_M = p.gps_error_max_m
     return current_params()
 
 
 @app.get("/init_epidemic")
+@locked
 def init_epidemic():
     """Ініціалізація: усі здорові, крім одного випадкового 'нульового пацієнта'."""
     global states, dead_count
@@ -266,11 +333,11 @@ def init_epidemic():
         "patient_zero": patient_zero,
         "states": states,
         "stats": get_epidemic_stats(),
-        "reinfection_enabled": REINFECTION_ENABLED,
     }
 
 
 @app.get("/step_epidemic")
+@locked
 def step_epidemic():
     """Один крок симуляції: інкубація -> зараження сусідів (з урахуванням відстані)
     -> одужання/смерть. Оновлення синхронне: читаємо states, пишемо в new_states."""
@@ -337,5 +404,4 @@ def step_epidemic():
     return {
         "states": states,
         "stats": get_epidemic_stats(),
-        "reinfection_enabled": REINFECTION_ENABLED,
     }

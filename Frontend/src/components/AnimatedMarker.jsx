@@ -1,69 +1,89 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { Marker } from 'react-leaflet';
 
-const AnimatedMarker = ({ lat, lng, duration = 3000, ...props }) => {
-  const markerRef = useRef(null);
-  const animationRef = useRef(null);
+// ---------------------------------------------------------------------------
+// Один спільний цикл requestAnimationFrame для всіх маркерів
+// (замість окремого циклу на кожен із 1000 маркерів).
+// ---------------------------------------------------------------------------
+const FRAME_MS = 33; // ~30 кадрів/с: для повільного руху це візуально плавно, а DOM навантажується вдвічі менше
 
-  // Примусово перетворюємо в числа для захисту від рядкових даних
-  const targetLat = Number(lat);
-  const targetLng = Number(lng);
+const animators = new Set(); // кожен елемент — функція step(now), що повертає true, поки анімація триває
+let rafId = null;
+let lastFrame = 0;
 
-  // Зберігаємо поточну позицію в рефі (числа)
-  const currentPosRef = useRef([targetLat, targetLng]);
-  
-  // Стейт потрібен тільки для ініціалізації та фіксації кінця анімації
-  const [displayPosition, setDisplayPosition] = useState([targetLat, targetLng]);
+const tick = (now) => {
+    if (now - lastFrame >= FRAME_MS) {
+        lastFrame = now;
+        for (const step of animators) {
+            if (!step(now)) animators.delete(step); // видалення під час обходу Set безпечне
+        }
+    }
+    rafId = animators.size > 0 ? requestAnimationFrame(tick) : null;
+};
 
-  useEffect(() => {
-    // Скасовуємо попередню анімацію, якщо вона активна
-    if (animationRef.current) {
-      cancelAnimationFrame(animationRef.current);
+const startAnimator = (step) => {
+    animators.add(step);
+    if (rafId === null) rafId = requestAnimationFrame(tick);
+};
+
+// ---------------------------------------------------------------------------
+// Маркер, що безперервно їде до останньої отриманої точки.
+//
+// Чому він не зупиняється між оновленнями:
+//  1. Рух ЛІНІЙНИЙ (без ease-in/ease-out), тому швидкість не падає до нуля на кінці відрізка.
+//  2. Новий відрізок завжди починається з ПОТОЧНОЇ позиції маркера на екрані,
+//     а не з попередньої цільової точки — тож стрибків немає.
+//  3. Тривалість руху = виміряний інтервал між оновленнями × 1.1. Маркер «доїжджає»
+//     трохи пізніше, ніж приходять нові дані, тому до нової цілі він завжди ще в дорозі.
+// ---------------------------------------------------------------------------
+const AnimatedMarker = ({ lat, lng, icon, duration = 4000 }) => {
+    const markerRef = useRef(null);
+    const initialPosition = useRef([lat, lng]); // стале значення: react-leaflet не «смикатиме» маркер при рендері
+    const shown = useRef({ lat, lng });          // де маркер зараз на екрані
+    const motion = useRef({ from: { lat, lng }, to: { lat, lng }, start: 0, duration });
+    const lastUpdate = useRef(null);
+    const avgInterval = useRef(duration);        // згладжений інтервал між оновленнями, мс
+    const stepRef = useRef(null);
+
+    if (stepRef.current === null) {
+        stepRef.current = (now) => {
+            const m = motion.current;
+            const t = Math.min(1, Math.max(0, (now - m.start) / m.duration));
+            const pos = {
+                lat: m.from.lat + (m.to.lat - m.from.lat) * t,
+                lng: m.from.lng + (m.to.lng - m.from.lng) * t,
+            };
+            shown.current = pos;
+            if (markerRef.current) markerRef.current.setLatLng([pos.lat, pos.lng]);
+            return t < 1;
+        };
     }
 
-    const startPos = [...currentPosRef.current];
-    const endPos = [targetLat, targetLng];
+    // Надійшла нова ціль -> розпочати новий відрізок з поточної позиції
+    useEffect(() => {
+        const now = performance.now();
+        if (lastUpdate.current !== null) {
+            const interval = now - lastUpdate.current;
+            avgInterval.current = 0.5 * avgInterval.current + 0.5 * interval;
+        }
+        lastUpdate.current = now;
 
-    // Якщо координати взагалі не змінилися — нічого не анімуємо
-    if (startPos[0] === endPos[0] && startPos[1] === endPos[1]) return;
+        motion.current = {
+            from: { ...shown.current },
+            to: { lat, lng },
+            start: now,
+            duration: avgInterval.current * 1.1,
+        };
+        startAnimator(stepRef.current);
+    }, [lat, lng]);
 
-    let startTimestamp = null;
+    // При видаленні маркера (наприклад, померла точка) — прибрати його з циклу анімації
+    useEffect(() => {
+        const step = stepRef.current;
+        return () => animators.delete(step);
+    }, []);
 
-    const animate = (timestamp) => {
-      if (!startTimestamp) startTimestamp = timestamp;
-      const elapsed = timestamp - startTimestamp;
-      const progress = Math.min(elapsed / duration, 1);
-
-      // Формула лінійної інтерполяції (LERP)
-      const currentLat = startPos[0] + (endPos[0] - startPos[0]) * progress;
-      const currentLng = startPos[1] + (endPos[1] - startPos[1]) * progress;
-      const newPos = [currentLat, currentLng];
-
-      // Оновлюємо реф, щоб наступний крок/анімація стартували звідси
-      currentPosRef.current = newPos;
-
-      // Рухаємо маркер на карті в обхід React (прямо через Leaflet для плавности)
-      if (markerRef.current) {
-        markerRef.current.setLatLng(newPos);
-      }
-
-      if (progress < 1) {
-        animationRef.current = requestAnimationFrame(animate);
-      } else {
-        setDisplayPosition(endPos); // Синхронізуємо стейт в кінці шляху
-      }
-    };
-
-    animationRef.current = requestAnimationFrame(animate);
-
-    return () => {
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
-      }
-    };
-  }, [targetLat, targetLng, duration]); // Ефект чітко стежить за зміною координат
-
-  return <Marker position={displayPosition} ref={markerRef} {...props} />;
+    return <Marker ref={markerRef} position={initialPosition.current} icon={icon} />;
 };
 
 export default AnimatedMarker;
